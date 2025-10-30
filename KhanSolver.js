@@ -1,709 +1,742 @@
 /**
- * Khan Academy Auto-Solver v2.0
- * Detecta e resolve automaticamente exercícios do Khan Academy
- * ATENÇÃO: Use apenas para fins educacionais
+ * Khan Academy Auto-Solver v4.0
+ * Versão com detecção inteligente de respostas
  */
 
 (function() {
     'use strict';
     
+    if (window.khanAutoSolverRunning) {
+        alert('❌ Script já está rodando!');
+        return;
+    }
+    window.khanAutoSolverRunning = true;
+    
+    console.log('%c🚀 Khan Auto-Solver v4.0 - Smart Edition', 'color: #14bf96; font-size: 16px; font-weight: bold;');
+    
     // ==================== CONFIGURAÇÃO ====================
     const CONFIG = {
+        delay: 1200,
         autoMode: false,
-        delay: 800,
-        retryAttempts: 3,
         debug: true,
-        autoNext: true
+        retryOnWrong: true
     };
-
+    
     // ==================== UTILITÁRIOS ====================
-    const Utils = {
-        log: (...args) => CONFIG.debug && console.log('%c[Khan Auto]', 'color: #14bf96; font-weight: bold;', ...args),
-        error: (...args) => console.error('%c[Khan Auto]', 'color: #e74c3c; font-weight: bold;', ...args),
-        wait: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
-        
-        // Trigger eventos realistas
-        triggerEvents: (element, value = null) => {
-            if (value !== null) element.value = value;
-            
-            ['input', 'change', 'blur', 'keyup', 'keydown'].forEach(eventType => {
-                element.dispatchEvent(new Event(eventType, { bubbles: true, cancelable: true }));
-            });
-            
-            // Eventos React
-            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-            if (nativeInputValueSetter && value !== null) {
-                nativeInputValueSetter.call(element, value);
-            }
-            
-            element.dispatchEvent(new Event('input', { bubbles: true }));
-        },
-        
-        // Verificar visibilidade
-        isVisible: (element) => {
-            if (!element) return false;
-            const style = window.getComputedStyle(element);
-            return style.display !== 'none' && 
-                   style.visibility !== 'hidden' && 
-                   style.opacity !== '0' &&
-                   element.offsetParent !== null;
-        },
-        
-        // Extrair números
-        extractNumbers: (text) => {
-            const matches = text.match(/-?\d+\.?\d*/g);
-            return matches ? matches.map(n => parseFloat(n)) : [];
-        },
-        
-        // Avaliar expressão matemática
-        evalMath: (expr) => {
-            try {
-                expr = expr.replace(/×|x/gi, '*').replace(/÷/g, '/');
-                return Function('"use strict"; return (' + expr + ')')();
-            } catch {
-                return null;
-            }
+    const log = (msg, ...args) => {
+        if (CONFIG.debug) {
+            console.log('%c[Khan]', 'color: #14bf96; font-weight: bold;', msg, ...args);
         }
     };
-
-    // ==================== DETECTOR DE RESPOSTAS ====================
-    const AnswerDetector = {
-        // Procurar resposta no código fonte
-        findInSource: () => {
+    
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    
+    const isVisible = (el) => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        return style.display !== 'none' && 
+               style.visibility !== 'hidden' && 
+               style.opacity !== '0' &&
+               el.offsetWidth > 0 && 
+               el.offsetHeight > 0;
+    };
+    
+    const simulateInput = (input, value) => {
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 
+            'value'
+        ).set;
+        
+        nativeSetter.call(input, value);
+        
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        input.dispatchEvent(new Event('blur', { bubbles: true }));
+    };
+    
+    // ==================== DETECTOR DE RESPOSTAS AVANÇADO ====================
+    const AnswerFinder = {
+        // Procurar em todos os objetos da página
+        deepSearch: () => {
+            log('🔍 Procurando respostas na página...');
+            const found = [];
+            
+            // 1. Procurar em __NEXT_DATA__ (Next.js)
             try {
-                // Procurar em objetos React
+                const nextData = document.getElementById('__NEXT_DATA__');
+                if (nextData) {
+                    const data = JSON.parse(nextData.textContent);
+                    log('Next.js data encontrado:', data);
+                    const answers = AnswerFinder.searchObject(data, ['answer', 'correct', 'solution']);
+                    if (answers.length > 0) found.push(...answers);
+                }
+            } catch (e) {}
+            
+            // 2. Procurar em window objects
+            try {
+                const keys = Object.keys(window);
+                for (const key of keys) {
+                    if (key.toLowerCase().includes('answer') || 
+                        key.toLowerCase().includes('solution') ||
+                        key.toLowerCase().includes('correct')) {
+                        log('Objeto suspeito encontrado:', key, window[key]);
+                        found.push(window[key]);
+                    }
+                }
+            } catch (e) {}
+            
+            // 3. Procurar em React Fiber
+            try {
                 const reactRoot = document.querySelector('[data-reactroot], #react-root, #root');
                 if (reactRoot) {
-                    const reactFiber = Object.keys(reactRoot).find(key => key.startsWith('__reactFiber'));
-                    if (reactFiber) {
-                        const fiber = reactRoot[reactFiber];
-                        return AnswerDetector.searchReactTree(fiber);
+                    const fiberKey = Object.keys(reactRoot).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+                    if (fiberKey) {
+                        const answers = AnswerFinder.searchReactFiber(reactRoot[fiberKey]);
+                        if (answers.length > 0) found.push(...answers);
                     }
                 }
-                
-                // Procurar em window objects
-                for (let key in window) {
-                    if (key.includes('answer') || key.includes('solution') || key.includes('correct')) {
-                        Utils.log('Possível resposta em window.' + key, window[key]);
+            } catch (e) {}
+            
+            // 4. Procurar em data attributes
+            try {
+                const dataElements = document.querySelectorAll('[data-answer], [data-correct-answer], [data-solution]');
+                dataElements.forEach(el => {
+                    const answer = el.dataset.answer || el.dataset.correctAnswer || el.dataset.solution;
+                    if (answer) {
+                        log('Resposta em data attribute:', answer);
+                        found.push(answer);
                     }
-                }
-                
-                // Procurar em atributos data
-                const dataElements = document.querySelectorAll('[data-answer], [data-correct], [data-solution]');
-                if (dataElements.length > 0) {
-                    Utils.log('Elementos com data-answer encontrados:', dataElements);
-                    return Array.from(dataElements).map(el => ({
-                        answer: el.dataset.answer || el.dataset.correct || el.dataset.solution,
-                        element: el
-                    }));
-                }
-                
-            } catch (e) {
-                Utils.error('Erro ao procurar resposta:', e);
-            }
-            return null;
+                });
+            } catch (e) {}
+            
+            // 5. Procurar em comentários HTML
+            try {
+                const html = document.documentElement.outerHTML;
+                const commentRegex = /<!--[\s\S]*?-->/g;
+                const comments = html.match(commentRegex) || [];
+                comments.forEach(comment => {
+                    if (comment.toLowerCase().includes('answer') || comment.toLowerCase().includes('correct')) {
+                        log('Comentário suspeito:', comment);
+                    }
+                });
+            } catch (e) {}
+            
+            log('Total de respostas encontradas:', found.length, found);
+            return found;
         },
         
-        // Pesquisar na árvore React
-        searchReactTree: (fiber, depth = 0, maxDepth = 15) => {
-            if (!fiber || depth > maxDepth) return null;
+        // Buscar recursivamente em objetos
+        searchObject: (obj, keywords, depth = 0, maxDepth = 10) => {
+            if (depth > maxDepth || !obj || typeof obj !== 'object') return [];
+            
+            const results = [];
             
             try {
-                // Procurar em props
-                if (fiber.memoizedProps) {
-                    const props = fiber.memoizedProps;
-                    if (props.answer || props.correctAnswer || props.solution) {
-                        Utils.log('Resposta encontrada em React props:', props);
-                        return props.answer || props.correctAnswer || props.solution;
+                for (const [key, value] of Object.entries(obj)) {
+                    const keyLower = key.toLowerCase();
+                    
+                    // Verificar se a chave contém palavra-chave
+                    if (keywords.some(kw => keyLower.includes(kw))) {
+                        log(`Resposta encontrada em ${key}:`, value);
+                        results.push(value);
+                    }
+                    
+                    // Recursão
+                    if (typeof value === 'object' && value !== null) {
+                        results.push(...AnswerFinder.searchObject(value, keywords, depth + 1, maxDepth));
                     }
                 }
-                
-                // Procurar em state
-                if (fiber.memoizedState) {
-                    const state = fiber.memoizedState;
-                    if (state && (state.answer || state.correctAnswer)) {
-                        Utils.log('Resposta encontrada em React state:', state);
-                        return state.answer || state.correctAnswer;
-                    }
-                }
-                
-                // Recursão em filhos
-                if (fiber.child) {
-                    const result = AnswerDetector.searchReactTree(fiber.child, depth + 1, maxDepth);
-                    if (result) return result;
-                }
-                
-                // Recursão em siblings
-                if (fiber.sibling) {
-                    const result = AnswerDetector.searchReactTree(fiber.sibling, depth + 1, maxDepth);
-                    if (result) return result;
-                }
-                
-            } catch (e) {
-                // Continuar silenciosamente
-            }
+            } catch (e) {}
             
-            return null;
+            return results;
         },
         
-        // Analisar contexto da questão
+        // Buscar em React Fiber
+        searchReactFiber: (fiber, depth = 0, maxDepth = 20, visited = new WeakSet()) => {
+            if (!fiber || depth > maxDepth || visited.has(fiber)) return [];
+            visited.add(fiber);
+            
+            const results = [];
+            
+            try {
+                // Verificar props
+                if (fiber.memoizedProps) {
+                    const props = fiber.memoizedProps;
+                    if (props.answer) {
+                        log('Resposta em React props:', props.answer);
+                        results.push(props.answer);
+                    }
+                    if (props.correctAnswer) {
+                        log('Resposta correta em React props:', props.correctAnswer);
+                        results.push(props.correctAnswer);
+                    }
+                    if (props.solution) {
+                        log('Solução em React props:', props.solution);
+                        results.push(props.solution);
+                    }
+                    if (props.choices && Array.isArray(props.choices)) {
+                        const correct = props.choices.find(c => c.correct === true);
+                        if (correct) {
+                            log('Resposta correta em choices:', correct);
+                            results.push(correct);
+                        }
+                    }
+                }
+                
+                // Verificar state
+                if (fiber.memoizedState) {
+                    results.push(...AnswerFinder.searchObject(fiber.memoizedState, ['answer', 'correct', 'solution'], 0, 3));
+                }
+                
+                // Recursão em child e sibling
+                if (fiber.child) {
+                    results.push(...AnswerFinder.searchReactFiber(fiber.child, depth + 1, maxDepth, visited));
+                }
+                if (fiber.sibling) {
+                    results.push(...AnswerFinder.searchReactFiber(fiber.sibling, depth + 1, maxDepth, visited));
+                }
+            } catch (e) {}
+            
+            return results;
+        },
+        
+        // Analisar questão e calcular resposta
         analyzeQuestion: () => {
+            log('📊 Analisando questão...');
+            
             const questionSelectors = [
                 '[class*="question"]',
                 '[class*="problem"]',
-                '[role="main"]',
-                '.perseus-renderer'
+                '[class*="exercise"]',
+                '.perseus-renderer',
+                '[role="main"]'
             ];
             
+            let questionText = '';
             for (const selector of questionSelectors) {
-                const questionEl = document.querySelector(selector);
-                if (questionEl) {
-                    const text = questionEl.textContent;
-                    Utils.log('Texto da questão:', text);
-                    
-                    // Tentar resolver matemática simples
-                    const numbers = Utils.extractNumbers(text);
-                    if (numbers.length >= 2) {
-                        // Operações comuns
-                        const operations = [
-                            numbers[0] + numbers[1],
-                            numbers[0] - numbers[1],
-                            numbers[0] * numbers[1],
-                            numbers[0] / numbers[1]
-                        ];
-                        Utils.log('Possíveis respostas calculadas:', operations);
-                        return operations;
-                    }
-                }
-            }
-            return null;
-        }
-    };
-
-    // ==================== SOLUCIONADORES ====================
-    const Solvers = {
-        // Múltipla escolha
-        multipleChoice: async () => {
-            Utils.log('Resolvendo múltipla escolha...');
-            
-            const selectors = [
-                'input[type="radio"]',
-                '[role="radio"]',
-                '[role="radiogroup"] > *',
-                '.perseus-radio-option',
-                '[class*="radio"]'
-            ];
-            
-            let options = [];
-            for (const selector of selectors) {
-                const elements = Array.from(document.querySelectorAll(selector)).filter(Utils.isVisible);
-                if (elements.length > 0) {
-                    options = elements;
+                const el = document.querySelector(selector);
+                if (el) {
+                    questionText = el.textContent;
                     break;
                 }
             }
             
-            if (options.length === 0) {
-                Utils.error('Nenhuma opção encontrada');
+            if (!questionText) return null;
+            
+            log('Texto da questão:', questionText.substring(0, 200));
+            
+            // Extrair números
+            const numbers = questionText.match(/-?\d+\.?\d*/g);
+            if (!numbers || numbers.length < 2) return null;
+            
+            const nums = numbers.map(n => parseFloat(n));
+            log('Números encontrados:', nums);
+            
+            // Detectar operação
+            const operations = {
+                '+': (a, b) => a + b,
+                'mais': (a, b) => a + b,
+                'soma': (a, b) => a + b,
+                '-': (a, b) => a - b,
+                'menos': (a, b) => a - b,
+                'subtra': (a, b) => a - b,
+                '×': (a, b) => a * b,
+                '*': (a, b) => a * b,
+                'vezes': (a, b) => a * b,
+                'multiplic': (a, b) => a * b,
+                '÷': (a, b) => a / b,
+                '/': (a, b) => a / b,
+                'divid': (a, b) => a / b
+            };
+            
+            for (const [op, fn] of Object.entries(operations)) {
+                if (questionText.toLowerCase().includes(op)) {
+                    const result = fn(nums[0], nums[1]);
+                    log(`Operação detectada: ${nums[0]} ${op} ${nums[1]} = ${result}`);
+                    return result;
+                }
+            }
+            
+            return null;
+        }
+    };
+    
+    // ==================== SOLUCIONADORES INTELIGENTES ====================
+    const findElements = (selectors) => {
+        for (const selector of selectors) {
+            try {
+                const elements = Array.from(document.querySelectorAll(selector)).filter(isVisible);
+                if (elements.length > 0) return elements;
+            } catch (e) {}
+        }
+        return [];
+    };
+    
+    const solvers = {
+        multipleChoice: async () => {
+            log('Resolvendo múltipla escolha...');
+            
+            const radioSelectors = [
+                'input[type="radio"]',
+                '[role="radio"]',
+                '[role="radiogroup"] label',
+                'label[for*="radio"]',
+                '[class*="choice"]',
+                '[class*="radio"]'
+            ];
+            
+            const radios = findElements(radioSelectors);
+            
+            if (radios.length === 0) {
+                log('❌ Nenhuma opção encontrada');
                 return false;
             }
             
-            Utils.log(`${options.length} opções encontradas`);
+            log(`✅ ${radios.length} opções encontradas`);
             
-            // Tentar encontrar resposta
-            const answer = AnswerDetector.findInSource();
-            if (answer) {
-                Utils.log('Resposta detectada:', answer);
-                // Tentar fazer match com as opções
-                for (let i = 0; i < options.length; i++) {
-                    const text = options[i].textContent || options[i].value;
-                    if (text.includes(answer) || answer.toString().includes(text)) {
-                        options[i].click();
-                        Utils.log('Opção correta clicada:', i);
-                        return true;
+            // Procurar resposta
+            const answers = AnswerFinder.deepSearch();
+            const calculated = AnswerFinder.analyzeQuestion();
+            
+            if (calculated !== null) {
+                log('📐 Resposta calculada:', calculated);
+                answers.unshift(calculated);
+            }
+            
+            // Tentar fazer match com as opções
+            if (answers.length > 0) {
+                for (let i = 0; i < radios.length; i++) {
+                    const optionText = radios[i].textContent || radios[i].value || '';
+                    
+                    for (const answer of answers) {
+                        const answerStr = String(answer);
+                        
+                        if (optionText.includes(answerStr) || 
+                            answerStr.includes(optionText) ||
+                            Math.abs(parseFloat(optionText) - parseFloat(answerStr)) < 0.01) {
+                            
+                            log('✅ Match encontrado! Opção:', i, optionText);
+                            radios[i].click();
+                            return true;
+                        }
                     }
                 }
             }
             
-            // Selecionar aleatoriamente se não encontrar
-            const randomIndex = Math.floor(Math.random() * options.length);
-            options[randomIndex].click();
-            Utils.log('Opção aleatória clicada:', randomIndex);
+            // Se não encontrou, tentar a primeira ou aleatória
+            log('⚠️ Nenhum match encontrado, tentando aleatoriamente');
+            const idx = Math.floor(Math.random() * radios.length);
+            radios[idx].click();
+            log(`Opção ${idx} selecionada`);
             
-            await Utils.wait(300);
+            await sleep(500);
             return true;
         },
         
-        // Input de texto/número
         textInput: async () => {
-            Utils.log('Resolvendo input de texto...');
+            log('Resolvendo input de texto...');
             
-            const inputs = Array.from(document.querySelectorAll(
-                'input[type="text"], input[type="number"], input[inputmode="numeric"], input[inputmode="decimal"], textarea'
-            )).filter(Utils.isVisible);
+            const inputSelectors = [
+                'input[type="text"]',
+                'input[type="number"]',
+                'input[inputmode="numeric"]',
+                'input[inputmode="decimal"]',
+                'textarea:not([readonly])'
+            ];
+            
+            const inputs = findElements(inputSelectors);
             
             if (inputs.length === 0) {
-                Utils.error('Nenhum input encontrado');
+                log('❌ Nenhum input encontrado');
                 return false;
             }
             
-            Utils.log(`${inputs.length} inputs encontrados`);
+            log(`✅ ${inputs.length} inputs encontrados`);
             
-            // Tentar encontrar resposta
-            let answer = AnswerDetector.findInSource();
+            // Procurar resposta
+            let answer = null;
             
-            if (!answer) {
-                // Tentar calcular da questão
-                const calculated = AnswerDetector.analyzeQuestion();
-                if (calculated && calculated.length > 0) {
-                    answer = calculated[0];
+            // 1. Tentar calcular da questão
+            const calculated = AnswerFinder.analyzeQuestion();
+            if (calculated !== null) {
+                answer = calculated;
+                log('📐 Usando resposta calculada:', answer);
+            }
+            
+            // 2. Tentar encontrar na página
+            if (answer === null) {
+                const found = AnswerFinder.deepSearch();
+                if (found.length > 0) {
+                    // Usar a primeira resposta numérica encontrada
+                    for (const f of found) {
+                        const num = parseFloat(f);
+                        if (!isNaN(num)) {
+                            answer = num;
+                            log('🔍 Resposta encontrada na página:', answer);
+                            break;
+                        }
+                    }
                 }
             }
             
-            if (!answer) {
-                // Valor padrão
-                answer = Math.floor(Math.random() * 100);
+            // 3. Fallback: número aleatório baseado no contexto
+            if (answer === null) {
+                const questionText = document.body.textContent;
+                const numbers = questionText.match(/\d+/g);
+                if (numbers && numbers.length > 0) {
+                    answer = numbers[0];
+                    log('⚠️ Usando número do contexto:', answer);
+                } else {
+                    answer = Math.floor(Math.random() * 100);
+                    log('⚠️ Usando número aleatório:', answer);
+                }
             }
             
             // Preencher todos os inputs
             for (const input of inputs) {
-                Utils.triggerEvents(input, answer.toString());
-                Utils.log('Input preenchido com:', answer);
+                simulateInput(input, String(answer));
+                log(`Input preenchido: ${answer}`);
             }
             
-            await Utils.wait(300);
+            await sleep(500);
             return true;
         },
         
-        // Dropdown/Select
         dropdown: async () => {
-            Utils.log('Resolvendo dropdown...');
+            log('Resolvendo dropdown...');
             
-            const selects = Array.from(document.querySelectorAll('select')).filter(Utils.isVisible);
+            const selects = findElements(['select']);
             
             if (selects.length === 0) {
-                Utils.error('Nenhum dropdown encontrado');
+                log('❌ Nenhum dropdown encontrado');
                 return false;
             }
+            
+            // Procurar resposta
+            const answers = AnswerFinder.deepSearch();
             
             for (const select of selects) {
-                if (select.options.length > 1) {
-                    const randomIndex = 1 + Math.floor(Math.random() * (select.options.length - 1));
-                    select.selectedIndex = randomIndex;
-                    Utils.triggerEvents(select);
-                    Utils.log('Dropdown selecionado:', select.options[randomIndex].text);
+                let selected = false;
+                
+                // Tentar match com respostas encontradas
+                if (answers.length > 0) {
+                    for (let i = 0; i < select.options.length; i++) {
+                        const optionText = select.options[i].textContent;
+                        
+                        for (const answer of answers) {
+                            if (optionText.includes(String(answer)) || 
+                                String(answer).includes(optionText)) {
+                                select.selectedIndex = i;
+                                selected = true;
+                                log('✅ Dropdown: match encontrado na opção', i);
+                                break;
+                            }
+                        }
+                        if (selected) break;
+                    }
                 }
+                
+                // Se não encontrou, selecionar aleatória
+                if (!selected && select.options.length > 1) {
+                    const idx = 1 + Math.floor(Math.random() * (select.options.length - 1));
+                    select.selectedIndex = idx;
+                    log(`⚠️ Dropdown: opção aleatória ${idx}`);
+                }
+                
+                select.dispatchEvent(new Event('change', { bubbles: true }));
             }
             
-            await Utils.wait(300);
+            await sleep(500);
             return true;
         },
         
-        // Checkbox
         checkbox: async () => {
-            Utils.log('Resolvendo checkbox...');
+            log('Resolvendo checkbox...');
             
-            const checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"]')).filter(Utils.isVisible);
+            const checkboxes = findElements(['input[type="checkbox"]']);
             
             if (checkboxes.length === 0) {
-                Utils.error('Nenhum checkbox encontrado');
+                log('❌ Nenhum checkbox encontrado');
                 return false;
             }
             
-            // Marcar alguns aleatoriamente
-            checkboxes.forEach(cb => {
-                if (Math.random() > 0.4) {
-                    cb.checked = true;
-                    Utils.triggerEvents(cb);
-                }
-            });
+            // Procurar respostas
+            const answers = AnswerFinder.deepSearch();
             
-            Utils.log(`${checkboxes.length} checkboxes processados`);
-            await Utils.wait(300);
-            return true;
-        },
-        
-        // Área de desenho/gráfico
-        canvas: async () => {
-            Utils.log('Detectado exercício com canvas - pulando...');
-            return false;
-        }
-    };
-
-    // ==================== DETECTOR DE TIPO ====================
-    const ExerciseDetector = {
-        detect: () => {
-            // Ordem de prioridade na detecção
-            if (document.querySelector('input[type="radio"], [role="radio"], [role="radiogroup"]')) {
-                return 'multipleChoice';
-            }
-            if (document.querySelector('input[type="text"], input[type="number"], input[inputmode="numeric"], textarea')) {
-                return 'textInput';
-            }
-            if (document.querySelector('select')) {
-                return 'dropdown';
-            }
-            if (document.querySelector('input[type="checkbox"]')) {
-                return 'checkbox';
-            }
-            if (document.querySelector('canvas')) {
-                return 'canvas';
-            }
-            return 'unknown';
-        }
-    };
-
-    // ==================== CONTROLADOR DE BOTÕES ====================
-    const ButtonController = {
-        findButton: (keywords) => {
-            const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'));
-            
-            for (const btn of buttons) {
-                if (!Utils.isVisible(btn)) continue;
+            // Tentar match com labels
+            for (let i = 0; i < checkboxes.length; i++) {
+                const cb = checkboxes[i];
+                const label = cb.closest('label') || document.querySelector(`label[for="${cb.id}"]`);
+                const labelText = label ? label.textContent : '';
                 
-                const text = (btn.textContent || btn.value || '').toLowerCase();
-                const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
-                const fullText = text + ' ' + ariaLabel;
+                let shouldCheck = false;
                 
-                for (const keyword of keywords) {
-                    if (fullText.includes(keyword.toLowerCase())) {
-                        return btn;
+                for (const answer of answers) {
+                    if (labelText.includes(String(answer))) {
+                        shouldCheck = true;
+                        log('✅ Checkbox match:', labelText);
+                        break;
                     }
                 }
-            }
-            return null;
-        },
-        
-        check: async () => {
-            const keywords = ['check', 'verificar', 'submit', 'enviar', 'conferir'];
-            const btn = ButtonController.findButton(keywords);
-            
-            if (btn) {
-                Utils.log('Botão de verificação encontrado:', btn.textContent);
-                await Utils.wait(CONFIG.delay);
-                btn.click();
-                return true;
+                
+                if (!shouldCheck) {
+                    shouldCheck = Math.random() > 0.5;
+                }
+                
+                cb.checked = shouldCheck;
+                cb.dispatchEvent(new Event('change', { bubbles: true }));
             }
             
-            Utils.error('Botão de verificação não encontrado');
-            return false;
-        },
-        
-        next: async () => {
-            const keywords = ['next', 'próxim', 'continuar', 'continue', 'avançar'];
-            const btn = ButtonController.findButton(keywords);
-            
-            if (btn) {
-                Utils.log('Botão próximo encontrado:', btn.textContent);
-                await Utils.wait(CONFIG.delay);
-                btn.click();
-                return true;
-            }
-            
-            return false;
-        },
-        
-        tryAgain: async () => {
-            const keywords = ['try again', 'tentar', 'retry', 'repetir'];
-            const btn = ButtonController.findButton(keywords);
-            
-            if (btn) {
-                Utils.log('Botão tentar novamente encontrado');
-                await Utils.wait(CONFIG.delay);
-                btn.click();
-                return true;
-            }
-            
-            return false;
+            await sleep(500);
+            return true;
         }
     };
-
+    
+    // ==================== DETECTOR DE TIPO ====================
+    const detectType = () => {
+        if (findElements(['input[type="radio"]', '[role="radio"]']).length > 0) {
+            return 'multipleChoice';
+        }
+        if (findElements(['input[type="text"]', 'input[type="number"]']).length > 0) {
+            return 'textInput';
+        }
+        if (findElements(['select']).length > 0) {
+            return 'dropdown';
+        }
+        if (findElements(['input[type="checkbox"]']).length > 0) {
+            return 'checkbox';
+        }
+        return null;
+    };
+    
+    // ==================== BOTÕES ====================
+    const findButton = (keywords) => {
+        const buttons = findElements(['button', '[role="button"]', 'input[type="submit"]']);
+        
+        for (const btn of buttons) {
+            const text = (btn.textContent || btn.value || '').toLowerCase();
+            const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+            const combined = text + ' ' + label;
+            
+            for (const keyword of keywords) {
+                if (combined.includes(keyword.toLowerCase())) {
+                    return btn;
+                }
+            }
+        }
+        return null;
+    };
+    
+    const clickCheck = async () => {
+        const btn = findButton(['check', 'verificar', 'submit', 'enviar']);
+        if (btn) {
+            log('✅ Botão verificar encontrado');
+            await sleep(CONFIG.delay);
+            btn.click();
+            return true;
+        }
+        log('❌ Botão verificar não encontrado');
+        return false;
+    };
+    
+    const clickNext = async () => {
+        const btn = findButton(['next', 'próxim', 'continuar', 'continue']);
+        if (btn) {
+            log('✅ Próximo');
+            await sleep(CONFIG.delay);
+            btn.click();
+            return true;
+        }
+        return false;
+    };
+    
+    const clickTryAgain = async () => {
+        const btn = findButton(['try again', 'tentar', 'novamente']);
+        if (btn) {
+            log('🔄 Tentando novamente');
+            await sleep(CONFIG.delay);
+            btn.click();
+            return true;
+        }
+        return false;
+    };
+    
+    // ==================== VERIFICAR RESULTADO ====================
+    const checkResult = () => {
+        // Procurar indicadores
+        const correct = document.querySelector('[class*="correct"]:not([class*="incorrect"]), [data-test-id*="correct"]');
+        const incorrect = document.querySelector('[class*="incorrect"], [class*="wrong"], [data-test-id*="incorrect"]');
+        
+        if (correct && isVisible(correct)) {
+            log('✅ CORRETO!');
+            return 'correct';
+        }
+        if (incorrect && isVisible(incorrect)) {
+            log('❌ INCORRETO');
+            return 'incorrect';
+        }
+        return 'unknown';
+    };
+    
     // ==================== MOTOR PRINCIPAL ====================
-    const Engine = {
-        solve: async () => {
-            Utils.log('=== Iniciando resolução ===');
+    const solve = async () => {
+        try {
+            showNotification('🔍 Analisando...', 'info');
             
-            const type = ExerciseDetector.detect();
-            Utils.log('Tipo detectado:', type);
-            
-            if (type === 'unknown') {
-                UI.showNotification('Tipo de exercício não reconhecido!', 'error');
+            const type = detectType();
+            if (!type) {
+                showNotification('❌ Tipo não reconhecido', 'error');
                 return false;
             }
             
-            let solved = false;
+            log(`📝 Tipo: ${type}`);
+            showNotification(`📝 Resolvendo ${type}...`, 'info');
             
-            try {
-                solved = await Solvers[type]();
-            } catch (e) {
-                Utils.error('Erro ao resolver:', e);
-                solved = false;
-            }
-            
+            const solved = await solvers[type]();
             if (!solved) {
-                UI.showNotification('Não foi possível resolver automaticamente', 'error');
+                showNotification('❌ Não foi possível resolver', 'error');
                 return false;
             }
             
-            // Verificar resposta
-            await Utils.wait(CONFIG.delay);
-            const checked = await ButtonController.check();
+            await sleep(CONFIG.delay);
+            const checked = await clickCheck();
             
             if (!checked) {
-                UI.showNotification('Não foi possível verificar a resposta', 'warning');
+                showNotification('⚠️ Botão verificar não encontrado', 'warning');
                 return false;
             }
             
-            // Aguardar resultado
-            await Utils.wait(1500);
+            await sleep(2000);
             
-            // Verificar se acertou ou errou
-            const isCorrect = Engine.checkResult();
+            const result = checkResult();
             
-            if (isCorrect === true) {
-                UI.showNotification('✓ Resposta correta!', 'success');
-                
-                if (CONFIG.autoNext) {
-                    await Utils.wait(1000);
-                    await ButtonController.next();
+            if (result === 'correct') {
+                showNotification('✅ CORRETO!', 'success');
+                await sleep(1000);
+                await clickNext();
+                return true;
+            } else if (result === 'incorrect') {
+                showNotification('❌ INCORRETO - Tentando novamente', 'error');
+                if (CONFIG.retryOnWrong) {
+                    await sleep(1000);
+                    await clickTryAgain();
+                    await sleep(2000);
+                    return await solve(); // Tentar novamente
                 }
-            } else if (isCorrect === false) {
-                UI.showNotification('✗ Resposta incorreta', 'error');
-                await Utils.wait(1000);
-                await ButtonController.tryAgain();
+            } else {
+                showNotification('✓ Resposta enviada', 'success');
+                await sleep(1000);
+                await clickNext();
             }
             
             return true;
-        },
+            
+        } catch (error) {
+            log('❌ Erro:', error);
+            showNotification('❌ Erro: ' + error.message, 'error');
+            return false;
+        }
+    };
+    
+    // ==================== AUTO MODE ====================
+    const startAutoMode = async () => {
+        CONFIG.autoMode = true;
+        updateAutoButton();
         
-        checkResult: () => {
-            // Procurar indicadores de resposta correta/incorreta
-            const correctSelectors = [
-                '[class*="correct"]',
-                '[class*="success"]',
-                '[data-test-id*="correct"]'
-            ];
+        while (CONFIG.autoMode) {
+            const success = await solve();
+            await sleep(CONFIG.delay * 2);
             
-            const incorrectSelectors = [
-                '[class*="incorrect"]',
-                '[class*="error"]',
-                '[class*="wrong"]',
-                '[data-test-id*="incorrect"]'
-            ];
-            
-            for (const selector of correctSelectors) {
-                const el = document.querySelector(selector);
-                if (el && Utils.isVisible(el)) {
-                    Utils.log('Indicador de resposta correta encontrado');
-                    return true;
-                }
-            }
-            
-            for (const selector of incorrectSelectors) {
-                const el = document.querySelector(selector);
-                if (el && Utils.isVisible(el)) {
-                    Utils.log('Indicador de resposta incorreta encontrado');
-                    return false;
-                }
-            }
-            
-            return null;
-        },
-        
-        autoMode: async () => {
-            if (!CONFIG.autoMode) return;
-            
-            Utils.log('Modo automático ativado');
-            
-            while (CONFIG.autoMode) {
-                await Engine.solve();
-                await Utils.wait(CONFIG.delay * 3);
-                
-                // Verificar se ainda há exercícios
-                const hasExercise = ExerciseDetector.detect() !== 'unknown';
-                if (!hasExercise) {
-                    Utils.log('Nenhum exercício encontrado, parando modo automático');
-                    CONFIG.autoMode = false;
-                    break;
-                }
+            if (!detectType()) {
+                log('Sem mais questões');
+                CONFIG.autoMode = false;
+                updateAutoButton();
+                break;
             }
         }
     };
-
-    // ==================== INTERFACE ====================
-    const UI = {
-        create: () => {
-            const container = document.createElement('div');
-            container.id = 'khan-auto-ui';
-            container.innerHTML = `
-                <style>
-                    #khan-auto-ui {
-                        position: fixed;
-                        top: 20px;
-                        right: 20px;
-                        z-index: 999999;
-                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    }
-                    .khan-panel {
-                        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                        border-radius: 12px;
-                        padding: 20px;
-                        box-shadow: 0 10px 40px rgba(0,0,0,0.3);
-                        min-width: 280px;
-                        color: white;
-                    }
-                    .khan-header {
-                        display: flex;
-                        justify-content: space-between;
-                        align-items: center;
-                        margin-bottom: 15px;
-                        padding-bottom: 15px;
-                        border-bottom: 2px solid #14bf96;
-                    }
-                    .khan-title {
-                        font-size: 16px;
-                        font-weight: bold;
-                        color: #14bf96;
-                    }
-                    .khan-version {
-                        font-size: 10px;
-                        color: #888;
-                    }
-                    .khan-btn {
-                        width: 100%;
-                        padding: 12px;
-                        margin: 8px 0;
-                        border: none;
-                        border-radius: 8px;
-                        font-size: 14px;
-                        font-weight: 600;
-                        cursor: pointer;
-                        transition: all 0.3s ease;
-                        text-transform: uppercase;
-                        letter-spacing: 0.5px;
-                    }
-                    .khan-btn:hover {
-                        transform: translateY(-2px);
-                        box-shadow: 0 5px 15px rgba(0,0,0,0.3);
-                    }
-                    .khan-btn-primary {
-                        background: linear-gradient(135deg, #14bf96 0%, #0f9d7d 100%);
-                        color: white;
-                    }
-                    .khan-btn-auto {
-                        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                        color: white;
-                    }
-                    .khan-btn-danger {
-                        background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
-                        color: white;
-                    }
-                    .khan-status {
-                        font-size: 12px;
-                        color: #aaa;
-                        text-align: center;
-                        margin-top: 10px;
-                    }
-                    .khan-notification {
-                        position: fixed;
-                        top: 20px;
-                        left: 50%;
-                        transform: translateX(-50%);
-                        padding: 15px 30px;
-                        border-radius: 8px;
-                        font-weight: 600;
-                        z-index: 9999999;
-                        animation: slideDown 0.3s ease;
-                    }
-                    @keyframes slideDown {
-                        from { opacity: 0; transform: translateX(-50%) translateY(-20px); }
-                        to { opacity: 1; transform: translateX(-50%) translateY(0); }
-                    }
-                    .khan-notif-success { background: #14bf96; color: white; }
-                    .khan-notif-error { background: #e74c3c; color: white; }
-                    .khan-notif-warning { background: #f39c12; color: white; }
-                </style>
-                <div class="khan-panel">
-                    <div class="khan-header">
-                        <div>
-                            <div class="khan-title">Khan Auto-Solver</div>
-                            <div class="khan-version">v2.0</div>
-                        </div>
-                    </div>
-                    <button class="khan-btn khan-btn-primary" id="khan-solve">
-                        🎯 Resolver Agora
-                    </button>
-                    <button class="khan-btn khan-btn-auto" id="khan-auto">
-                        🤖 Modo Automático
-                    </button>
-                    <button class="khan-btn khan-btn-danger" id="khan-close">
-                        ✕ Fechar
-                    </button>
-                    <div class="khan-status" id="khan-status">
-                        Pronto para usar
-                    </div>
+    
+    const stopAutoMode = () => {
+        CONFIG.autoMode = false;
+        updateAutoButton();
+        showNotification('⏸️ Pausado', 'info');
+    };
+    
+    // ==================== UI ====================
+    const createUI = () => {
+        const style = document.createElement('style');
+        style.textContent = `
+            #khan-auto-ui{position:fixed;top:20px;right:20px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+            .khan-panel{background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);border-radius:16px;padding:24px;box-shadow:0 20px 60px rgba(0,0,0,.4);min-width:300px}
+            .khan-header{text-align:center;margin-bottom:20px;padding-bottom:16px;border-bottom:2px solid #14bf96}
+            .khan-title{font-size:18px;font-weight:700;color:#14bf96;margin:0}
+            .khan-version{font-size:11px;color:#888;margin-top:4px}
+            .khan-btn{width:100%;padding:14px;margin:10px 0;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;transition:all .3s;text-transform:uppercase;letter-spacing:.5px}
+            .khan-btn:hover{transform:translateY(-3px);box-shadow:0 10px 20px rgba(0,0,0,.3)}
+            .khan-btn-primary{background:linear-gradient(135deg,#14bf96 0%,#0f9d7d 100%);color:white}
+            .khan-btn-auto{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white}
+            .khan-btn-auto.active{background:linear-gradient(135deg,#e74c3c 0%,#c0392b 100%)}
+            .khan-btn-close{background:rgba(231,76,60,.2);color:#e74c3c;border:2px solid #e74c3c}
+            .khan-notification{position:fixed;top:20px;left:50%;transform:translateX(-50%);padding:16px 32px;border-radius:12px;font-weight:600;z-index:2147483647;animation:slideDown .3s ease;box-shadow:0 10px 30px rgba(0,0,0,.3)}
+            @keyframes slideDown{from{opacity:0;transform:translateX(-50%) translateY(-20px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
+            .notif-success{background:#14bf96;color:white}
+            .notif-error{background:#e74c3c;color:white}
+            .notif-warning{background:#f39c12;color:white}
+            .notif-info{background:#3498db;color:white}
+        `;
+        document.head.appendChild(style);
+        
+        const container = document.createElement('div');
+        container.id = 'khan-auto-ui';
+        container.innerHTML = `
+            <div class="khan-panel">
+                <div class="khan-header">
+                    <div class="khan-title">Khan Auto-Solver</div>
+                    <div class="khan-version">v4.0 - Smart</div>
                 </div>
-            `;
-            
-            document.body.appendChild(container);
-            
-            // Event listeners
-            document.getElementById('khan-solve').addEventListener('click', () => {
-                Engine.solve();
-            });
-            
-            document.getElementById('khan-auto').addEventListener('click', () => {
-                CONFIG.autoMode = !CONFIG.autoMode;
-                const btn = document.getElementById('khan-auto');
-                
-                if (CONFIG.autoMode) {
-                    btn.textContent = '⏸️ Parar Automático';
-                    btn.style.background = 'linear-gradient(135deg, #e74c3c 0%, #c0392b 100%)';
-                    Engine.autoMode();
-                } else {
-                    btn.textContent = '🤖 Modo Automático';
-                    btn.style.background = 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)';
-                }
-            });
-            
-            document.getElementById('khan-close').addEventListener('click', () => {
-                container.remove();
-            });
-        },
+                <button class="khan-btn khan-btn-primary" id="khan-solve">🎯 Resolver Agora</button>
+                <button class="khan-btn khan-btn-auto" id="khan-auto">🤖 Modo Automático</button>
+                <button class="khan-btn khan-btn-close" id="khan-close">✕ Fechar</button>
+            </div>
+        `;
         
-        showNotification: (message, type = 'success') => {
-            const notif = document.createElement('div');
-            notif.className = `khan-notification khan-notif-${type}`;
-            notif.textContent = message;
-            document.body.appendChild(notif);
-            
-            setTimeout(() => notif.remove(), 3000);
-        },
+        document.body.appendChild(container);
         
-        updateStatus: (text) => {
-            const status = document.getElementById('khan-status');
-            if (status) status.textContent = text;
+        document.getElementById('khan-solve').addEventListener('click', solve);
+        document.getElementById('khan-auto').addEventListener('click', () => {
+            CONFIG.autoMode ? stopAutoMode() : startAutoMode();
+        });
+        document.getElementById('khan-close').addEventListener('click', () => {
+            container.remove();
+            window.khanAutoSolverRunning = false;
+        });
+    };
+    
+    const updateAutoButton = () => {
+        const btn = document.getElementById('khan-auto');
+        if (btn) {
+            btn.textContent = CONFIG.autoMode ? '⏸️ Pausar' : '🤖 Modo Automático';
+            CONFIG.autoMode ? btn.classList.add('active') : btn.classList.remove('active');
         }
     };
-
-    // ==================== INICIALIZAÇÃO ====================
-    const init = () => {
-        if (!window.location.hostname.includes('khanacademy.org')) {
-            alert('⚠️ Este script funciona apenas no Khan Academy!');
-            return;
-        }
-        
-        Utils.log('Khan Auto-Solver v2.0 carregado!');
-        Utils.log('Desenvolvido para fins educacionais');
-        
-        UI.create();
+    
+    const showNotification = (message, type = 'info') => {
+        const notif = document.createElement('div');
+        notif.className = `khan-notification notif-${type}`;
+        notif.textContent = message;
+        document.body.appendChild(notif);
+        setTimeout(() => notif.remove(), 3000);
     };
-
-    // Executar
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init);
-    } else {
-        init();
+    
+    // ==================== INIT ====================
+    if (!window.location.hostname.includes('khanacademy.org')) {
+        alert('⚠️ Este script funciona apenas no Khan Academy!');
+        window.khanAutoSolverRunning = false;
+        return;
     }
-
+    
+    log('✅ Iniciado!');
+    createUI();
+    showNotification('✅ Khan Auto-Solver carregado!', 'success');
+    
 })();
